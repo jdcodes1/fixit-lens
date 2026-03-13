@@ -115,44 +115,49 @@ async def websocket_endpoint(websocket: WebSocket):
                     while True:
                         raw = await websocket.receive()
 
-                        if "bytes" in raw and raw["bytes"]:
-                            # Binary = audio from mic
-                            await gemini.send_realtime_input(
-                                audio=types.Blob(
-                                    data=raw["bytes"],
-                                    mime_type="audio/pcm;rate=16000",
-                                )
-                            )
-
-                        elif "text" in raw and raw["text"]:
-                            msg = json.loads(raw["text"])
-
-                            if msg["type"] == "video_frame":
-                                now = time.time()
-                                if now - last_frame_time < 1.0 / MAX_FRAMES_PER_SEC:
-                                    continue
-                                last_frame_time = now
-
+                        try:
+                            if "bytes" in raw and raw["bytes"]:
+                                # Binary = audio from mic
                                 await gemini.send_realtime_input(
-                                    media=types.Blob(
-                                        data=base64.b64decode(msg["data"]),
-                                        mime_type="image/jpeg",
+                                    audio=types.Blob(
+                                        data=raw["bytes"],
+                                        mime_type="audio/pcm;rate=16000",
                                     )
                                 )
 
-                            elif msg["type"] == "text_message":
-                                await gemini.send_client_content(
-                                    turns=types.Content(
-                                        role="user",
-                                        parts=[types.Part(text=msg["text"])],
-                                    ),
-                                    turn_complete=True,
-                                )
+                            elif "text" in raw and raw["text"]:
+                                msg = json.loads(raw["text"])
+
+                                if msg["type"] == "video_frame":
+                                    now = time.time()
+                                    if now - last_frame_time < 1.0 / MAX_FRAMES_PER_SEC:
+                                        continue
+                                    last_frame_time = now
+
+                                    await gemini.send_realtime_input(
+                                        media=types.Blob(
+                                            data=base64.b64decode(msg["data"]),
+                                            mime_type="image/jpeg",
+                                        )
+                                    )
+
+                                elif msg["type"] == "text_message":
+                                    await gemini.send_client_content(
+                                        turns=types.Content(
+                                            role="user",
+                                            parts=[types.Part(text=msg["text"])],
+                                        ),
+                                        turn_complete=True,
+                                    )
+                        except Exception as e:
+                            # Log but keep the loop alive
+                            print(f"Error forwarding to Gemini: {e}", flush=True)
+                            continue
 
                 except WebSocketDisconnect:
                     print("Client disconnected")
                 except Exception as e:
-                    print(f"Receive error: {e}")
+                    print(f"Receive loop error: {e}", flush=True)
 
             async def send_to_client():
                 try:

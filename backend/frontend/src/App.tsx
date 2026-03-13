@@ -23,6 +23,10 @@ export default function FixitApp() {
   const playbackContextRef = useRef<AudioContext | null>(null);
   const nextPlayTimeRef = useRef(0);
 
+  // Use refs for values accessed in closures
+  const isMutedRef = useRef(false);
+  const isStreamingRef = useRef(false);
+
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [safetyAlert, setSafetyAlert] = useState<string | null>(null);
   const [isStreaming, setIsStreaming] = useState(false);
@@ -33,12 +37,19 @@ export default function FixitApp() {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [textInput, setTextInput] = useState('');
   const [frozenFrame, setFrozenFrame] = useState<string | null>(null);
-  const [showChat] = useState(true);
+
+  // Keep refs in sync with state
+  useEffect(() => { isMutedRef.current = isMuted; }, [isMuted]);
+  useEffect(() => { isStreamingRef.current = isStreaming; }, [isStreaming]);
 
   const addMessage = useCallback((role: ChatMessage['role'], text: string) => {
     setMessages(prev => {
-      // For assistant transcript, append to last assistant message if it exists
-      if (role === 'assistant' && prev.length > 0 && prev[prev.length - 1].role === 'assistant') {
+      // For user/assistant transcript, append to last message of same role
+      if (
+        (role === 'assistant' || role === 'user') &&
+        prev.length > 0 &&
+        prev[prev.length - 1].role === role
+      ) {
         const updated = [...prev];
         updated[updated.length - 1] = {
           ...updated[updated.length - 1],
@@ -67,7 +78,6 @@ export default function FixitApp() {
 
     ws.onmessage = (event) => {
       if (event.data instanceof ArrayBuffer) {
-        // Audio from Gemini — play it
         playAudioChunk(event.data);
         return;
       }
@@ -89,7 +99,8 @@ export default function FixitApp() {
 
     ws.onclose = () => {
       setReadyState(3);
-      if (isStreaming) {
+      // Use ref to avoid stale closure
+      if (isStreamingRef.current) {
         setTimeout(connectWs, 3000);
       }
     };
@@ -97,10 +108,11 @@ export default function FixitApp() {
     ws.onerror = () => {
       setReadyState(3);
     };
-  }, [isStreaming, addMessage]);
+  }, [addMessage, playAudioChunk]);
 
   // --- Audio Playback ---
-  const playAudioChunk = useCallback((buffer: ArrayBuffer) => {
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  function playAudioChunk(buffer: ArrayBuffer) {
     if (!playbackContextRef.current) {
       playbackContextRef.current = new AudioContext({ sampleRate: 24000 });
     }
@@ -122,7 +134,7 @@ export default function FixitApp() {
     const startTime = Math.max(now, nextPlayTimeRef.current);
     source.start(startTime);
     nextPlayTimeRef.current = startTime + audioBuffer.duration;
-  }, []);
+  }
 
   // --- Audio Capture (mic → backend) ---
   const startAudioCapture = useCallback((mediaStream: MediaStream) => {
@@ -134,7 +146,8 @@ export default function FixitApp() {
     scriptProcessorRef.current = processor;
 
     processor.onaudioprocess = (e) => {
-      if (isMuted) return;
+      // Use ref so we always see latest mute state
+      if (isMutedRef.current) return;
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
@@ -149,17 +162,11 @@ export default function FixitApp() {
 
     source.connect(processor);
     processor.connect(audioCtx.destination);
-  }, [isMuted]);
-
-  // Update mute state on processor
-  useEffect(() => {
-    // isMuted is captured in the closure of onaudioprocess via ref
-  }, [isMuted]);
+  }, []);
 
   // --- Start/Stop Camera + Mic ---
   const toggleCamera = async () => {
     if (isStreaming) {
-      // Stop everything
       stream?.getTracks().forEach(track => track.stop());
       setStream(null);
       setIsStreaming(false);
@@ -187,10 +194,7 @@ export default function FixitApp() {
       setIsStreaming(true);
       setIsLoading(false);
 
-      // Connect WS after permission granted
       connectWs();
-
-      // Start audio capture
       startAudioCapture(newStream);
     } catch (err) {
       setIsLoading(false);
@@ -237,7 +241,6 @@ export default function FixitApp() {
   // --- Photo Capture / Freeze ---
   const handleCapture = () => {
     if (frozenFrame) {
-      // Unfreeze
       setFrozenFrame(null);
       return;
     }
@@ -246,12 +249,10 @@ export default function FixitApp() {
     const context = canvasRef.current.getContext('2d');
     if (!context) return;
 
-    // High quality capture
     context.drawImage(videoRef.current, 0, 0, 640, 480);
     const highQuality = canvasRef.current.toDataURL('image/jpeg', 0.9);
     setFrozenFrame(highQuality);
 
-    // Send high-quality frame with prompt
     sendJson({ type: 'video_frame', data: highQuality.split(',')[1] });
     sendJson({
       type: 'text_message',
@@ -293,6 +294,23 @@ export default function FixitApp() {
             <Wrench className="text-white" size={16} />
           </div>
           <h1 className="text-sm font-black tracking-tight uppercase leading-none text-white/90">Fixit Lens</h1>
+
+          {/* Capture / Freeze Button */}
+          <button
+            onClick={handleCapture}
+            className={`ml-2 p-2 rounded-full border backdrop-blur-md transition-all active:scale-90 ${
+              frozenFrame
+                ? 'bg-amber-500/30 border-amber-400/60 text-amber-300'
+                : 'bg-white/10 border-white/30 text-white'
+            }`}
+          >
+            {frozenFrame ? <XCircle size={18} /> : <Camera size={18} />}
+          </button>
+          {frozenFrame && (
+            <span className="text-amber-300 text-[10px] font-bold uppercase tracking-widest">
+              Frozen
+            </span>
+          )}
         </div>
 
         <div className="flex items-center gap-3">
@@ -352,25 +370,6 @@ export default function FixitApp() {
           )}
         </div>
 
-        {/* Capture / Freeze Button */}
-        <div className="absolute bottom-52 left-1/2 -translate-x-1/2 z-30 pointer-events-auto">
-          <button
-            onClick={handleCapture}
-            className={`p-4 rounded-full border-2 backdrop-blur-md shadow-xl transition-all active:scale-90 ${
-              frozenFrame
-                ? 'bg-amber-500/30 border-amber-400/60 text-amber-300'
-                : 'bg-white/10 border-white/30 text-white'
-            }`}
-          >
-            {frozenFrame ? <XCircle size={28} /> : <Camera size={28} />}
-          </button>
-          {frozenFrame && (
-            <p className="text-center text-amber-300 text-[10px] font-bold uppercase tracking-widest mt-2">
-              Tap to unfreeze
-            </p>
-          )}
-        </div>
-
         {/* Safety Alert Overlay */}
         {safetyAlert && (
           <div className="absolute top-24 left-4 right-4 z-50 bg-red-600 text-white p-5 rounded-2xl flex items-start gap-4 shadow-[0_20px_50px_rgba(220,38,38,0.5)] border border-red-400">
@@ -391,63 +390,61 @@ export default function FixitApp() {
         )}
 
         {/* Chat / Transcript Drawer */}
-        {showChat && (
-          <div className="absolute bottom-0 left-0 right-0 p-4 z-20 bg-gradient-to-t from-slate-950 via-slate-950/80 to-transparent">
-            <div className="max-w-xl mx-auto flex flex-col gap-3">
-              {/* Text input */}
-              <form
-                onSubmit={(e) => { e.preventDefault(); handleSendText(); }}
-                className="flex gap-2"
+        <div className="absolute bottom-0 left-0 right-0 p-4 z-20 bg-gradient-to-t from-slate-950 via-slate-950/80 to-transparent">
+          <div className="max-w-xl mx-auto flex flex-col gap-3">
+            {/* Text input */}
+            <form
+              onSubmit={(e) => { e.preventDefault(); handleSendText(); }}
+              className="flex gap-2"
+            >
+              <input
+                type="text"
+                value={textInput}
+                onChange={(e) => setTextInput(e.target.value)}
+                placeholder="Type a message..."
+                className="flex-1 bg-slate-800/80 backdrop-blur-md border border-white/10 rounded-xl px-4 py-3 text-sm text-white placeholder-slate-500 outline-none focus:border-blue-500/50 transition-colors"
+              />
+              <button
+                type="submit"
+                disabled={!textInput.trim()}
+                className="p-3 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-500 rounded-xl text-white transition-colors"
               >
-                <input
-                  type="text"
-                  value={textInput}
-                  onChange={(e) => setTextInput(e.target.value)}
-                  placeholder="Type a message..."
-                  className="flex-1 bg-slate-800/80 backdrop-blur-md border border-white/10 rounded-xl px-4 py-3 text-sm text-white placeholder-slate-500 outline-none focus:border-blue-500/50 transition-colors"
-                />
-                <button
-                  type="submit"
-                  disabled={!textInput.trim()}
-                  className="p-3 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-500 rounded-xl text-white transition-colors"
-                >
-                  <Send size={18} />
-                </button>
-              </form>
+                <Send size={18} />
+              </button>
+            </form>
 
-              {/* Messages */}
-              <div className="bg-slate-900/60 backdrop-blur-2xl rounded-2xl border border-white/10 shadow-2xl max-h-48 overflow-y-auto">
-                <div className="p-4 flex flex-col gap-2">
-                  <div className="flex items-center gap-2 text-blue-400 text-[10px] font-black uppercase tracking-[0.2em] mb-1">
-                    <CheckCircle2 size={14} />
-                    Conversation
-                  </div>
-                  {messages.length === 0 && (
-                    <p className="text-slate-500 text-sm">Listening... speak or type to begin.</p>
-                  )}
-                  {messages.map((msg) => (
-                    <div
-                      key={msg.id}
-                      className={`text-sm leading-relaxed ${
-                        msg.role === 'user'
-                          ? 'text-blue-300'
-                          : msg.role === 'error'
-                          ? 'text-red-400'
-                          : 'text-white'
-                      }`}
-                    >
-                      <span className="font-bold text-[10px] uppercase tracking-wider opacity-60 mr-2">
-                        {msg.role === 'user' ? 'You' : msg.role === 'error' ? 'Error' : 'AI'}
-                      </span>
-                      {msg.text}
-                    </div>
-                  ))}
-                  <div ref={chatEndRef} />
+            {/* Messages */}
+            <div className="bg-slate-900/60 backdrop-blur-2xl rounded-2xl border border-white/10 shadow-2xl max-h-48 overflow-y-auto">
+              <div className="p-4 flex flex-col gap-2">
+                <div className="flex items-center gap-2 text-blue-400 text-[10px] font-black uppercase tracking-[0.2em] mb-1">
+                  <CheckCircle2 size={14} />
+                  Conversation
                 </div>
+                {messages.length === 0 && (
+                  <p className="text-slate-500 text-sm">Listening... speak or type to begin.</p>
+                )}
+                {messages.map((msg) => (
+                  <div
+                    key={msg.id}
+                    className={`text-sm leading-relaxed ${
+                      msg.role === 'user'
+                        ? 'text-blue-300'
+                        : msg.role === 'error'
+                        ? 'text-red-400'
+                        : 'text-white'
+                    }`}
+                  >
+                    <span className="font-bold text-[10px] uppercase tracking-wider opacity-60 mr-2">
+                      {msg.role === 'user' ? 'You' : msg.role === 'error' ? 'Error' : 'AI'}
+                    </span>
+                    {msg.text}
+                  </div>
+                ))}
+                <div ref={chatEndRef} />
               </div>
             </div>
           </div>
-        )}
+        </div>
       </main>
 
       {/* Hidden Canvas */}
