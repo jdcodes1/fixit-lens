@@ -1,0 +1,11 @@
+node_modules/
+__pycache__/
+*.pyc
+.env
+.git
+.DS_Store
+*.log
+backend/assets/
+backend/index.html
+backend/node_modules/
+backend/frontend/node_modules/
