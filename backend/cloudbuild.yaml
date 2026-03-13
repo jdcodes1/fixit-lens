@@ -1,0 +1,23 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['build', '-t', 'us-central1-docker.pkg.dev/fixit-490103/fixit-lens-repo/backend-image', '.']
+  - name: 'gcr.io/cloud-builders/docker'
+    args: ['push', 'us-central1-docker.pkg.dev/fixit-490103/fixit-lens-repo/backend-image']
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'fixit-lens-backend'
+      - '--image'
+      - 'us-central1-docker.pkg.dev/fixit-490103/fixit-lens-repo/backend-image'
+      - '--region'
+      - 'us-central1'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+      - '--set-env-vars'
+      - 'GEMINI_API_KEY=projects/fixit-490103/secrets/GEMINI_API_KEY/versions/latest'
+      - '--min-instances'
+      - '1'
+      - '--session-affinity'
