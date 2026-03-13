@@ -31,7 +31,7 @@ api_key = os.environ.get("GOOGLE_API_KEY")
 if not api_key:
     raise RuntimeError("GOOGLE_API_KEY not set in environment")
 
-client = genai.Client(api_key=api_key, http_options={"api_version": "v1alpha"})
+client = genai.Client(api_key=api_key)
 
 SYSTEM_PROMPT = """You are Fixit Lens, an expert AR repair assistant. The user is showing you a live camera feed of something they want to fix or understand.
 
@@ -92,21 +92,22 @@ async def websocket_endpoint(websocket: WebSocket):
 
     try:
         # Retry loop for Gemini connection
-        session = None
+        gemini = None
         for attempt in range(3):
             try:
-                session = client.live.connect(
-                    model="gemini-2.0-flash-live", config=LIVE_CONFIG
+                session = client.aio.live.connect(
+                    model="gemini-2.5-flash-native-audio-preview-12-2025", config=LIVE_CONFIG
                 )
+                gemini = await session.__aenter__()
                 break
             except Exception as e:
-                print(f"Gemini connect attempt {attempt + 1} failed: {e}")
+                print(f"Gemini connect attempt {attempt + 1} failed: {type(e).__name__}: {e}", flush=True)
                 if attempt == 2:
-                    await send_error("Failed to connect to AI service after 3 attempts.")
+                    await send_error(f"Failed to connect to AI service after 3 attempts: {e}")
                     return
                 await asyncio.sleep(1)
 
-        async with session as gemini:
+        try:
 
             async def receive_from_client():
                 nonlocal last_frame_time
@@ -217,9 +218,11 @@ async def websocket_endpoint(websocket: WebSocket):
                     print(f"Send error: {e}")
 
             await asyncio.gather(receive_from_client(), send_to_client())
+        finally:
+            await session.__aexit__(None, None, None)
 
     except Exception as e:
-        print(f"WS session error: {e}")
+        print(f"WS session error: {e}", flush=True)
         await send_error(f"Session error: {e}")
     finally:
         connections_per_ip[client_ip] = max(0, connections_per_ip[client_ip] - 1)
