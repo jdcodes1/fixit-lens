@@ -1,118 +1,276 @@
-import { useEffect, useRef, useState } from 'react';
-import { Camera, AlertCircle, CheckCircle2, Wrench, RefreshCw } from 'lucide-react';
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { AlertCircle, CheckCircle2, Wrench, RefreshCw, X, Mic, MicOff, Camera, Send, XCircle } from 'lucide-react';
+import LandingPage from './components/LandingPage';
 
-const WEBSOCKET_URL = 'ws://localhost:8000/ws';
+interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant' | 'error';
+  text: string;
+  timestamp: number;
+}
+
+const WS_URL = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws`;
 
 export default function FixitApp() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const wsRef = useRef<WebSocket | null>(null);
-  
+  const chatEndRef = useRef<HTMLDivElement>(null);
+
+  // Audio refs
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const scriptProcessorRef = useRef<ScriptProcessorNode | null>(null);
+  const playbackContextRef = useRef<AudioContext | null>(null);
+  const nextPlayTimeRef = useRef(0);
+
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [safetyAlert, setSafetyAlert] = useState<string | null>(null);
-  const [transcript, setTranscript] = useState<string>("Initializing...");
   const [isStreaming, setIsStreaming] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
-  const [readyState, setReadyState] = useState<number>(0); // 0: CONNECTING, 1: OPEN, 2: CLOSING, 3: CLOSED
+  const [readyState, setReadyState] = useState<number>(3);
+  const [isMuted, setIsMuted] = useState(false);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [textInput, setTextInput] = useState('');
+  const [frozenFrame, setFrozenFrame] = useState<string | null>(null);
+  const [showChat] = useState(true);
 
-  // WebSocket Connection
-  useEffect(() => {
-    const connect = () => {
-      const ws = new WebSocket(WEBSOCKET_URL);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        setReadyState(1);
-        setTranscript("Connected to Fixit Backend.");
-      };
-
-      ws.onmessage = (event) => {
-        const msg = JSON.parse(event.data);
-        setIsProcessing(false);
-        if (msg.type === 'safety_alert') {
-          setSafetyAlert(msg.message);
-        } else if (msg.type === 'transcript') {
-          setTranscript(msg.text);
-        }
-      };
-
-      ws.onclose = () => {
-        setReadyState(3);
-        setTranscript("Connection lost. Reconnecting...");
-        setTimeout(connect, 3000);
-      };
-
-      ws.onerror = () => {
-        setReadyState(3);
-      };
-    };
-
-    connect();
-    return () => {
-      wsRef.current?.close();
-    };
+  const addMessage = useCallback((role: ChatMessage['role'], text: string) => {
+    setMessages(prev => {
+      // For assistant transcript, append to last assistant message if it exists
+      if (role === 'assistant' && prev.length > 0 && prev[prev.length - 1].role === 'assistant') {
+        const updated = [...prev];
+        updated[updated.length - 1] = {
+          ...updated[updated.length - 1],
+          text: updated[updated.length - 1].text + text,
+        };
+        return updated;
+      }
+      return [...prev, { id: crypto.randomUUID(), role, text, timestamp: Date.now() }];
+    });
   }, []);
 
-  const sendJsonMessage = (data: any) => {
+  // Auto-scroll chat
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages]);
+
+  // --- WebSocket ---
+  const connectWs = useCallback(() => {
+    const ws = new WebSocket(WS_URL);
+    ws.binaryType = 'arraybuffer';
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      setReadyState(1);
+    };
+
+    ws.onmessage = (event) => {
+      if (event.data instanceof ArrayBuffer) {
+        // Audio from Gemini — play it
+        playAudioChunk(event.data);
+        return;
+      }
+
+      const msg = JSON.parse(event.data);
+      setIsProcessing(false);
+
+      if (msg.type === 'safety_alert') {
+        setSafetyAlert(msg.message);
+        addMessage('assistant', `[SAFETY] ${msg.message}`);
+      } else if (msg.type === 'transcript') {
+        addMessage('assistant', msg.text);
+      } else if (msg.type === 'user_transcript') {
+        addMessage('user', msg.text);
+      } else if (msg.type === 'error') {
+        addMessage('error', msg.message);
+      }
+    };
+
+    ws.onclose = () => {
+      setReadyState(3);
+      if (isStreaming) {
+        setTimeout(connectWs, 3000);
+      }
+    };
+
+    ws.onerror = () => {
+      setReadyState(3);
+    };
+  }, [isStreaming, addMessage]);
+
+  // --- Audio Playback ---
+  const playAudioChunk = useCallback((buffer: ArrayBuffer) => {
+    if (!playbackContextRef.current) {
+      playbackContextRef.current = new AudioContext({ sampleRate: 24000 });
+    }
+    const ctx = playbackContextRef.current;
+    const int16 = new Int16Array(buffer);
+    const float32 = new Float32Array(int16.length);
+    for (let i = 0; i < int16.length; i++) {
+      float32[i] = int16[i] / 32768;
+    }
+
+    const audioBuffer = ctx.createBuffer(1, float32.length, 24000);
+    audioBuffer.getChannelData(0).set(float32);
+
+    const source = ctx.createBufferSource();
+    source.buffer = audioBuffer;
+    source.connect(ctx.destination);
+
+    const now = ctx.currentTime;
+    const startTime = Math.max(now, nextPlayTimeRef.current);
+    source.start(startTime);
+    nextPlayTimeRef.current = startTime + audioBuffer.duration;
+  }, []);
+
+  // --- Audio Capture (mic → backend) ---
+  const startAudioCapture = useCallback((mediaStream: MediaStream) => {
+    const audioCtx = new AudioContext({ sampleRate: 16000 });
+    audioContextRef.current = audioCtx;
+
+    const source = audioCtx.createMediaStreamSource(mediaStream);
+    const processor = audioCtx.createScriptProcessor(4096, 1, 1);
+    scriptProcessorRef.current = processor;
+
+    processor.onaudioprocess = (e) => {
+      if (isMuted) return;
+      const ws = wsRef.current;
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+
+      const float32 = e.inputBuffer.getChannelData(0);
+      const int16 = new Int16Array(float32.length);
+      for (let i = 0; i < float32.length; i++) {
+        const s = Math.max(-1, Math.min(1, float32[i]));
+        int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      ws.send(int16.buffer);
+    };
+
+    source.connect(processor);
+    processor.connect(audioCtx.destination);
+  }, [isMuted]);
+
+  // Update mute state on processor
+  useEffect(() => {
+    // isMuted is captured in the closure of onaudioprocess via ref
+  }, [isMuted]);
+
+  // --- Start/Stop Camera + Mic ---
+  const toggleCamera = async () => {
+    if (isStreaming) {
+      // Stop everything
+      stream?.getTracks().forEach(track => track.stop());
+      setStream(null);
+      setIsStreaming(false);
+      setFrozenFrame(null);
+      scriptProcessorRef.current?.disconnect();
+      audioContextRef.current?.close();
+      playbackContextRef.current?.close();
+      playbackContextRef.current = null;
+      wsRef.current?.close();
+      return;
+    }
+
+    try {
+      setIsLoading(true);
+      const newStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: 'environment' },
+        audio: {
+          sampleRate: 16000,
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+        },
+      });
+      setStream(newStream);
+      setIsStreaming(true);
+      setIsLoading(false);
+
+      // Connect WS after permission granted
+      connectWs();
+
+      // Start audio capture
+      startAudioCapture(newStream);
+    } catch (err) {
+      setIsLoading(false);
+      console.error('Error accessing camera/mic:', err);
+      addMessage('error', err instanceof Error ? err.message : 'Camera/mic access denied.');
+    }
+  };
+
+  // Attach stream to video
+  useEffect(() => {
+    if (isStreaming && stream && videoRef.current) {
+      videoRef.current.srcObject = stream;
+    }
+  }, [isStreaming, stream]);
+
+  // Frame capture loop
+  useEffect(() => {
+    let interval: ReturnType<typeof setInterval>;
+    if (isStreaming && readyState === 1 && !frozenFrame) {
+      interval = setInterval(captureFrame, 2000);
+    }
+    return () => clearInterval(interval);
+  }, [isStreaming, readyState, frozenFrame]);
+
+  const captureFrame = () => {
+    if (!videoRef.current || !canvasRef.current) return;
+    setIsProcessing(true);
+
+    const context = canvasRef.current.getContext('2d');
+    if (!context) return;
+
+    context.drawImage(videoRef.current, 0, 0, 640, 480);
+    const base64Frame = canvasRef.current.toDataURL('image/jpeg', 0.6);
+
+    sendJson({ type: 'video_frame', data: base64Frame.split(',')[1] });
+  };
+
+  const sendJson = (data: any) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(data));
     }
   };
 
-  // Start/Stop Camera
-  const toggleCamera = async () => {
-    if (isStreaming) {
-      stream?.getTracks().forEach(track => track.stop());
-      setStream(null);
-      setIsStreaming(false);
-      setTranscript("Camera stopped.");
-    } else {
-      try {
-        setTranscript("Requesting camera access...");
-        const newStream = await navigator.mediaDevices.getUserMedia({ 
-          video: { facingMode: 'environment' }, 
-          audio: false 
-        });
-        setStream(newStream);
-        if (videoRef.current) {
-          videoRef.current.srcObject = newStream;
-        }
-        setIsStreaming(true);
-        setTranscript("Live vision active. Show me the problem.");
-      } catch (err) {
-        console.error("Error accessing camera:", err);
-        setTranscript("Error: " + (err instanceof Error ? err.message : "Camera access denied."));
-      }
+  // --- Photo Capture / Freeze ---
+  const handleCapture = () => {
+    if (frozenFrame) {
+      // Unfreeze
+      setFrozenFrame(null);
+      return;
     }
-  };
-
-  // Frame Capture Loop
-  useEffect(() => {
-    let interval: any;
-    if (isStreaming && readyState === 1) {
-      interval = setInterval(() => {
-        captureFrame();
-      }, 2000);
-    }
-    return () => clearInterval(interval);
-  }, [isStreaming, readyState]);
-
-  const captureFrame = () => {
     if (!videoRef.current || !canvasRef.current) return;
-    setIsProcessing(true);
-    
+
     const context = canvasRef.current.getContext('2d');
     if (!context) return;
 
-    // Draw video frame to canvas
+    // High quality capture
     context.drawImage(videoRef.current, 0, 0, 640, 480);
-    const base64Frame = canvasRef.current.toDataURL('image/jpeg', 0.6);
-    
-    sendJsonMessage({
-      type: 'video_frame',
-      data: base64Frame.split(',')[1]
+    const highQuality = canvasRef.current.toDataURL('image/jpeg', 0.9);
+    setFrozenFrame(highQuality);
+
+    // Send high-quality frame with prompt
+    sendJson({ type: 'video_frame', data: highQuality.split(',')[1] });
+    sendJson({
+      type: 'text_message',
+      text: 'I just captured this frame for a closer look. Please give a detailed analysis of what you see, including any parts, damage, or repair steps.',
     });
+    setIsProcessing(true);
   };
+
+  // --- Text Input ---
+  const handleSendText = () => {
+    const text = textInput.trim();
+    if (!text) return;
+    sendJson({ type: 'text_message', text });
+    addMessage('user', text);
+    setTextInput('');
+  };
+
+  // --- Mute toggle ---
+  const toggleMute = () => setIsMuted(prev => !prev);
 
   const connectionStatus = {
     0: 'Connecting',
@@ -121,78 +279,108 @@ export default function FixitApp() {
     3: 'Offline',
   }[readyState] || 'Offline';
 
+  // Landing Page
+  if (!isStreaming) {
+    return <LandingPage onStart={toggleCamera} isLoading={isLoading} />;
+  }
+
   return (
     <div className="fixed inset-0 flex flex-col bg-slate-950 text-white font-sans overflow-hidden select-none">
       {/* Header */}
-      <header className="px-6 py-4 border-b border-slate-800/50 backdrop-blur-md flex justify-between items-center z-20 bg-slate-950/50">
+      <header className="absolute top-0 left-0 right-0 px-6 py-4 flex justify-between items-center z-20 bg-gradient-to-b from-black/80 to-transparent">
         <div className="flex items-center gap-3">
-          <div className="p-2 bg-blue-600 rounded-lg shadow-lg shadow-blue-900/20">
-            <Wrench className="text-white" size={20} />
+          <div className="p-2 bg-blue-600/80 backdrop-blur-md rounded-lg shadow-lg">
+            <Wrench className="text-white" size={16} />
           </div>
-          <div>
-            <h1 className="text-lg font-black tracking-tight uppercase leading-none">Fixit Lens</h1>
-            <p className="text-[10px] text-slate-500 uppercase tracking-[0.2em] mt-1 font-bold">Hackathon Prototype</p>
-          </div>
+          <h1 className="text-sm font-black tracking-tight uppercase leading-none text-white/90">Fixit Lens</h1>
         </div>
-        <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider border ${readyState === 1 ? 'bg-green-500/10 border-green-500/50 text-green-400' : 'bg-red-500/10 border-red-500/50 text-red-400'}`}>
-          <span className={`w-1.5 h-1.5 rounded-full ${readyState === 1 ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`} />
-          {connectionStatus}
+
+        <div className="flex items-center gap-3">
+          <div className={`flex items-center gap-2 px-3 py-1 rounded-full text-[10px] font-black uppercase tracking-wider border backdrop-blur-md ${readyState === 1 ? 'bg-green-500/10 border-green-500/50 text-green-400' : 'bg-red-500/10 border-red-500/50 text-red-400'}`}>
+            <span className={`w-1.5 h-1.5 rounded-full ${readyState === 1 ? 'bg-green-500 animate-pulse' : 'bg-red-500'}`} />
+            {connectionStatus}
+          </div>
+          <button
+            onClick={toggleMute}
+            className={`p-2 backdrop-blur-md rounded-full border transition-colors ${isMuted ? 'bg-red-500/20 border-red-500/30 text-red-400' : 'bg-black/40 border-white/10 text-white/70'}`}
+          >
+            {isMuted ? <MicOff size={18} /> : <Mic size={18} />}
+          </button>
+          <button
+            onClick={toggleCamera}
+            className="p-2 bg-black/40 backdrop-blur-md rounded-full border border-white/10 text-white/70 hover:bg-red-500/20 hover:text-red-400 transition-colors"
+          >
+            <X size={20} />
+          </button>
         </div>
       </header>
 
       {/* Main Viewport */}
       <main className="flex-1 relative flex flex-col min-h-0 bg-black">
         <div className="absolute inset-0 z-0 flex items-center justify-center">
-          <video 
-            ref={videoRef} 
-            autoPlay 
-            playsInline 
-            className={`h-full w-full object-cover transform transition-opacity duration-1000 ${isStreaming ? 'opacity-100' : 'opacity-0'}`}
-          />
-          {!isStreaming && (
-            <div className="flex flex-col items-center justify-center gap-6 text-slate-600 animate-pulse">
-              <Camera size={64} strokeWidth={1} />
-              <div className="text-center">
-                <p className="text-sm font-bold uppercase tracking-widest">Vision System Standby</p>
-                <p className="text-xs mt-1">Tap the camera icon below to begin</p>
-              </div>
-            </div>
+          {frozenFrame ? (
+            <img src={frozenFrame} alt="Captured frame" className="h-full w-full object-cover" />
+          ) : (
+            <video
+              ref={videoRef}
+              autoPlay
+              playsInline
+              muted
+              className="h-full w-full object-cover"
+            />
           )}
         </div>
 
         {/* HUD Overlays */}
-        {isStreaming && (
-          <div className="absolute inset-0 pointer-events-none z-10 border-[1px] border-white/10 m-4 rounded-3xl overflow-hidden">
-            <div className="absolute top-0 left-0 w-8 h-8 border-t-2 border-l-2 border-blue-500/50 rounded-tl-xl" />
-            <div className="absolute top-0 right-0 w-8 h-8 border-t-2 border-r-2 border-blue-500/50 rounded-tr-xl" />
-            <div className="absolute bottom-0 left-0 w-8 h-8 border-b-2 border-l-2 border-blue-500/50 rounded-bl-xl" />
-            <div className="absolute bottom-0 right-0 w-8 h-8 border-b-2 border-r-2 border-blue-500/50 rounded-br-xl" />
-            
-            <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 opacity-20">
-              <div className="w-12 h-12 border border-white rounded-full flex items-center justify-center">
-                <div className="w-1 h-1 bg-white rounded-full" />
-              </div>
-            </div>
+        <div className="absolute inset-0 pointer-events-none z-10 border-[1px] border-white/10 m-4 rounded-3xl overflow-hidden">
+          <div className="absolute top-0 left-0 w-8 h-8 border-t-2 border-l-2 border-blue-500/50 rounded-tl-xl" />
+          <div className="absolute top-0 right-0 w-8 h-8 border-t-2 border-r-2 border-blue-500/50 rounded-tr-xl" />
+          <div className="absolute bottom-0 left-0 w-8 h-8 border-b-2 border-l-2 border-blue-500/50 rounded-bl-xl" />
+          <div className="absolute bottom-0 right-0 w-8 h-8 border-b-2 border-r-2 border-blue-500/50 rounded-br-xl" />
 
-            {isProcessing && (
-              <div className="absolute top-8 right-8 flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-blue-400 bg-black/40 px-3 py-1.5 rounded-full backdrop-blur-md">
-                <RefreshCw size={12} className="animate-spin" />
-                Analyzing
-              </div>
-            )}
+          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 opacity-20">
+            <div className="w-12 h-12 border border-white rounded-full flex items-center justify-center">
+              <div className="w-1 h-1 bg-white rounded-full" />
+            </div>
           </div>
-        )}
+
+          {isProcessing && (
+            <div className="absolute top-20 right-8 flex items-center gap-2 text-[10px] font-bold uppercase tracking-widest text-blue-400 bg-black/40 px-3 py-1.5 rounded-full backdrop-blur-md">
+              <RefreshCw size={12} className="animate-spin" />
+              Analyzing
+            </div>
+          )}
+        </div>
+
+        {/* Capture / Freeze Button */}
+        <div className="absolute bottom-52 left-1/2 -translate-x-1/2 z-30 pointer-events-auto">
+          <button
+            onClick={handleCapture}
+            className={`p-4 rounded-full border-2 backdrop-blur-md shadow-xl transition-all active:scale-90 ${
+              frozenFrame
+                ? 'bg-amber-500/30 border-amber-400/60 text-amber-300'
+                : 'bg-white/10 border-white/30 text-white'
+            }`}
+          >
+            {frozenFrame ? <XCircle size={28} /> : <Camera size={28} />}
+          </button>
+          {frozenFrame && (
+            <p className="text-center text-amber-300 text-[10px] font-bold uppercase tracking-widest mt-2">
+              Tap to unfreeze
+            </p>
+          )}
+        </div>
 
         {/* Safety Alert Overlay */}
         {safetyAlert && (
-          <div className="absolute top-24 left-4 right-4 z-50 bg-red-600 text-white p-5 rounded-2xl flex items-start gap-4 shadow-[0_20px_50px_rgba(220,38,38,0.5)] border border-red-400 animate-in fade-in slide-in-from-top-4 duration-300">
+          <div className="absolute top-24 left-4 right-4 z-50 bg-red-600 text-white p-5 rounded-2xl flex items-start gap-4 shadow-[0_20px_50px_rgba(220,38,38,0.5)] border border-red-400">
             <div className="p-3 bg-red-800 rounded-xl">
               <AlertCircle size={24} />
             </div>
             <div className="flex-1">
               <p className="font-black uppercase text-xs tracking-widest mb-1 opacity-80">Severe Danger Warning</p>
               <p className="text-lg font-bold leading-tight">{safetyAlert}</p>
-              <button 
+              <button
                 onClick={() => setSafetyAlert(null)}
                 className="mt-4 px-4 py-2 bg-white text-red-600 rounded-lg font-black text-[10px] uppercase tracking-widest shadow-lg active:scale-95 transition-transform"
               >
@@ -202,55 +390,68 @@ export default function FixitApp() {
           </div>
         )}
 
-        {/* Instructions/Transcript Drawer */}
-        <div className="absolute bottom-0 left-0 right-0 p-6 z-20 bg-gradient-to-t from-slate-950 via-slate-950/80 to-transparent">
-          <div className="max-w-xl mx-auto">
-            <div className="bg-slate-900/60 backdrop-blur-2xl rounded-2xl p-5 border border-white/10 shadow-2xl transition-all duration-500">
-              <div className="flex items-center justify-between mb-3">
-                <div className="flex items-center gap-2 text-blue-400 text-[10px] font-black uppercase tracking-[0.2em]">
-                  <CheckCircle2 size={14} />
-                  Lens Feedback
-                </div>
-                {readyState === 1 && isStreaming && (
-                  <div className="flex gap-1">
-                    {[1,2,3].map(i => (
-                      <div key={i} className="w-1 h-1 bg-blue-500/50 rounded-full animate-bounce" style={{ animationDelay: `${i * 0.2}s` }} />
-                    ))}
+        {/* Chat / Transcript Drawer */}
+        {showChat && (
+          <div className="absolute bottom-0 left-0 right-0 p-4 z-20 bg-gradient-to-t from-slate-950 via-slate-950/80 to-transparent">
+            <div className="max-w-xl mx-auto flex flex-col gap-3">
+              {/* Text input */}
+              <form
+                onSubmit={(e) => { e.preventDefault(); handleSendText(); }}
+                className="flex gap-2"
+              >
+                <input
+                  type="text"
+                  value={textInput}
+                  onChange={(e) => setTextInput(e.target.value)}
+                  placeholder="Type a message..."
+                  className="flex-1 bg-slate-800/80 backdrop-blur-md border border-white/10 rounded-xl px-4 py-3 text-sm text-white placeholder-slate-500 outline-none focus:border-blue-500/50 transition-colors"
+                />
+                <button
+                  type="submit"
+                  disabled={!textInput.trim()}
+                  className="p-3 bg-blue-600 hover:bg-blue-500 disabled:bg-slate-700 disabled:text-slate-500 rounded-xl text-white transition-colors"
+                >
+                  <Send size={18} />
+                </button>
+              </form>
+
+              {/* Messages */}
+              <div className="bg-slate-900/60 backdrop-blur-2xl rounded-2xl border border-white/10 shadow-2xl max-h-48 overflow-y-auto">
+                <div className="p-4 flex flex-col gap-2">
+                  <div className="flex items-center gap-2 text-blue-400 text-[10px] font-black uppercase tracking-[0.2em] mb-1">
+                    <CheckCircle2 size={14} />
+                    Conversation
                   </div>
-                )}
-              </div>
-              <div className="text-white text-lg font-medium leading-relaxed min-h-[3rem]">
-                {transcript}
+                  {messages.length === 0 && (
+                    <p className="text-slate-500 text-sm">Listening... speak or type to begin.</p>
+                  )}
+                  {messages.map((msg) => (
+                    <div
+                      key={msg.id}
+                      className={`text-sm leading-relaxed ${
+                        msg.role === 'user'
+                          ? 'text-blue-300'
+                          : msg.role === 'error'
+                          ? 'text-red-400'
+                          : 'text-white'
+                      }`}
+                    >
+                      <span className="font-bold text-[10px] uppercase tracking-wider opacity-60 mr-2">
+                        {msg.role === 'user' ? 'You' : msg.role === 'error' ? 'Error' : 'AI'}
+                      </span>
+                      {msg.text}
+                    </div>
+                  ))}
+                  <div ref={chatEndRef} />
+                </div>
               </div>
             </div>
           </div>
-        </div>
+        )}
       </main>
 
-      {/* Hidden Canvas for capture */}
+      {/* Hidden Canvas */}
       <canvas ref={canvasRef} width="640" height="480" className="hidden" />
-
-      {/* Controls */}
-      <footer className="px-6 py-10 bg-slate-950 flex justify-center items-center relative z-30">
-        <button 
-          onClick={toggleCamera}
-          className={`group relative flex items-center justify-center transition-all duration-500 active:scale-90 ${isStreaming ? 'w-20 h-20' : 'w-24 h-24'}`}
-        >
-          <div className={`absolute inset-0 rounded-full border-2 transition-all duration-500 scale-125 opacity-20 ${isStreaming ? 'border-red-500' : 'border-blue-500'}`} />
-          
-          <div className={`w-full h-full rounded-full flex items-center justify-center transition-all duration-500 shadow-2xl ${isStreaming ? 'bg-red-500 hover:bg-red-400 shadow-red-900/40' : 'bg-blue-600 hover:bg-blue-500 shadow-blue-900/40'}`}>
-            {isStreaming ? (
-              <div className="w-7 h-7 bg-white rounded-md animate-pulse" />
-            ) : (
-              <Camera className="text-white group-hover:scale-110 transition-transform" size={32} />
-            )}
-          </div>
-        </button>
-        
-        <div className="absolute right-10 text-[10px] font-black uppercase tracking-[0.2em] text-slate-700 pointer-events-none">
-          Live Agent v0.1
-        </div>
-      </footer>
     </div>
   );
 }
