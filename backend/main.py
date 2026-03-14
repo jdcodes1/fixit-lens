@@ -381,35 +381,51 @@ async def websocket_endpoint(websocket: WebSocket):
             async def send_to_client():
                 try:
                     async for response in gemini.receive():
-                        # Audio data
-                        if response.data:
-                            try:
+                        try:
+                            # Audio data
+                            if response.data:
                                 await websocket.send_bytes(response.data)
-                            except Exception:
-                                break
 
-                        # Detect interruption
-                        if response.server_content and response.server_content.interrupted:
-                            try:
+                            # Detect interruption
+                            if response.server_content and response.server_content.interrupted:
                                 await websocket.send_json({"type": "interrupted"})
-                            except Exception:
-                                break
 
-                        # Server transcript (AI speech)
-                        server_text = (
-                            response.server_content
-                            and response.server_content.model_turn
-                            and response.server_content.model_turn.parts
-                        )
-                        if server_text:
-                            for part in server_text:
-                                if part.text:
-                                    text = part.text
-                                    cleaned = await parse_and_strip_markers(
-                                        text, step_state, searched_topics, websocket
-                                    )
-                                    if not cleaned:
-                                        continue
+                            # Server transcript (AI speech)
+                            server_text = (
+                                response.server_content
+                                and response.server_content.model_turn
+                                and response.server_content.model_turn.parts
+                            )
+                            if server_text:
+                                for part in server_text:
+                                    if part.text:
+                                        text = part.text
+                                        cleaned = await parse_and_strip_markers(
+                                            text, step_state, searched_topics, websocket
+                                        )
+                                        if not cleaned:
+                                            continue
+                                        if cleaned.startswith("[SAFETY_ALERT]"):
+                                            alert_msg = cleaned[len("[SAFETY_ALERT]"):].strip()
+                                            await websocket.send_json(
+                                                {"type": "safety_alert", "message": alert_msg}
+                                            )
+                                        else:
+                                            await websocket.send_json(
+                                                {"type": "transcript", "text": cleaned}
+                                            )
+
+                            # Output audio transcription
+                            if (
+                                response.server_content
+                                and response.server_content.output_transcription
+                                and response.server_content.output_transcription.text
+                            ):
+                                text = response.server_content.output_transcription.text
+                                cleaned = await parse_and_strip_markers(
+                                    text, step_state, searched_topics, websocket
+                                )
+                                if cleaned:
                                     if cleaned.startswith("[SAFETY_ALERT]"):
                                         alert_msg = cleaned[len("[SAFETY_ALERT]"):].strip()
                                         await websocket.send_json(
@@ -420,42 +436,28 @@ async def websocket_endpoint(websocket: WebSocket):
                                             {"type": "transcript", "text": cleaned}
                                         )
 
-                        # Output audio transcription
-                        if (
-                            response.server_content
-                            and response.server_content.output_transcription
-                            and response.server_content.output_transcription.text
-                        ):
-                            text = response.server_content.output_transcription.text
-                            cleaned = await parse_and_strip_markers(
-                                text, step_state, searched_topics, websocket
-                            )
-                            if cleaned:
-                                if cleaned.startswith("[SAFETY_ALERT]"):
-                                    alert_msg = cleaned[len("[SAFETY_ALERT]"):].strip()
-                                    await websocket.send_json(
-                                        {"type": "safety_alert", "message": alert_msg}
-                                    )
-                                else:
-                                    await websocket.send_json(
-                                        {"type": "transcript", "text": cleaned}
-                                    )
+                            # Input audio transcription (user speech)
+                            if (
+                                response.server_content
+                                and response.server_content.input_transcription
+                                and response.server_content.input_transcription.text
+                            ):
+                                await websocket.send_json(
+                                    {
+                                        "type": "user_transcript",
+                                        "text": response.server_content.input_transcription.text,
+                                    }
+                                )
 
-                        # Input audio transcription (user speech)
-                        if (
-                            response.server_content
-                            and response.server_content.input_transcription
-                            and response.server_content.input_transcription.text
-                        ):
-                            await websocket.send_json(
-                                {
-                                    "type": "user_transcript",
-                                    "text": response.server_content.input_transcription.text,
-                                }
-                            )
+                        except WebSocketDisconnect:
+                            print("Client disconnected during send", flush=True)
+                            return
+                        except Exception as e:
+                            print(f"Error in send iteration: {e}", flush=True)
+                            continue
 
                 except Exception as e:
-                    print(f"Send error: {e}")
+                    print(f"Gemini receive stream ended: {e}", flush=True)
 
             await asyncio.gather(receive_from_client(), send_to_client())
         finally:
