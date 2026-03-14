@@ -26,6 +26,7 @@ export default function FixitApp() {
   // Use refs for values accessed in closures
   const isMutedRef = useRef(false);
   const isStreamingRef = useRef(false);
+  const geminiReadyRef = useRef(false);
 
   const [stream, setStream] = useState<MediaStream | null>(null);
   const [safetyAlert, setSafetyAlert] = useState<string | null>(null);
@@ -85,7 +86,11 @@ export default function FixitApp() {
       const msg = JSON.parse(event.data);
       setIsProcessing(false);
 
-      if (msg.type === 'safety_alert') {
+      if (msg.type === 'status') {
+        if (msg.status === 'ready') {
+          geminiReadyRef.current = true;
+        }
+      } else if (msg.type === 'safety_alert') {
         setSafetyAlert(msg.message);
         addMessage('assistant', `[SAFETY] ${msg.message}`);
       } else if (msg.type === 'transcript') {
@@ -99,7 +104,7 @@ export default function FixitApp() {
 
     ws.onclose = () => {
       setReadyState(3);
-      // Use ref to avoid stale closure
+      geminiReadyRef.current = false;
       if (isStreamingRef.current) {
         setTimeout(connectWs, 3000);
       }
@@ -146,8 +151,8 @@ export default function FixitApp() {
     scriptProcessorRef.current = processor;
 
     processor.onaudioprocess = (e) => {
-      // Use ref so we always see latest mute state
       if (isMutedRef.current) return;
+      if (!geminiReadyRef.current) return;
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
 
@@ -233,6 +238,7 @@ export default function FixitApp() {
   };
 
   const sendJson = (data: any) => {
+    if (!geminiReadyRef.current) return;
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(data));
     }

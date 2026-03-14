@@ -70,6 +70,15 @@ MAX_CONNECTIONS_PER_IP = 3
 MAX_FRAMES_PER_SEC = 2
 
 
+async def _drain_ws(websocket: WebSocket, ready: asyncio.Event):
+    """Read and discard WS messages until Gemini is ready."""
+    try:
+        while not ready.is_set():
+            await websocket.receive()
+    except Exception:
+        pass
+
+
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
     client_ip = websocket.client.host if websocket.client else "unknown"
@@ -80,9 +89,10 @@ async def websocket_endpoint(websocket: WebSocket):
 
     await websocket.accept()
     connections_per_ip[client_ip] += 1
-    print(f"WebSocket connected from {client_ip}")
+    print(f"WebSocket connected from {client_ip}", flush=True)
 
     last_frame_time = 0.0
+    gemini_ready = asyncio.Event()
 
     async def send_error(msg: str):
         try:
@@ -90,7 +100,18 @@ async def websocket_endpoint(websocket: WebSocket):
         except Exception:
             pass
 
+    async def send_status(status: str):
+        try:
+            await websocket.send_json({"type": "status", "status": status})
+        except Exception:
+            pass
+
     try:
+        # Drain WS messages while Gemini connects (so the WS doesn't die)
+        drain_task = asyncio.create_task(_drain_ws(websocket, gemini_ready))
+
+        await send_status("connecting")
+
         # Retry loop for Gemini connection
         gemini = None
         for attempt in range(3):
@@ -106,6 +127,17 @@ async def websocket_endpoint(websocket: WebSocket):
                     await send_error(f"Failed to connect to AI service after 3 attempts: {e}")
                     return
                 await asyncio.sleep(1)
+
+        # Stop draining, start real processing
+        gemini_ready.set()
+        drain_task.cancel()
+        try:
+            await drain_task
+        except asyncio.CancelledError:
+            pass
+
+        await send_status("ready")
+        print("Gemini session ready", flush=True)
 
         try:
 
