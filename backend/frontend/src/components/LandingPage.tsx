@@ -1,4 +1,4 @@
-import { Camera, Wrench, Zap, ShieldCheck, ArrowRight, Scan, Sparkles, Loader2 } from 'lucide-react';
+import { Camera, Wrench, ShieldCheck, ArrowRight, Scan, Sparkles, Loader2, ListChecks, Package, Play } from 'lucide-react';
 
 interface LandingPageProps {
   onStart: () => void;
@@ -39,7 +39,7 @@ export default function LandingPage({ onStart, isLoading = false }: LandingPageP
               </span>
             </h1>
             <p className="text-slate-400 text-lg mt-3 leading-relaxed max-w-sm mx-auto">
-              Point your camera at anything broken. Get instant AI-powered repair guidance.
+              Your AI home repair assistant. Point your camera, get hands-free guidance.
             </p>
           </div>
         </div>
@@ -51,14 +51,28 @@ export default function LandingPage({ onStart, isLoading = false }: LandingPageP
             iconColor="text-blue-400"
             iconBg="bg-blue-500/10 border-blue-500/20"
             title="Real-Time Vision"
-            description="Gemini 2.0 analyzes your camera feed live, identifying parts and problems instantly"
+            description="Live camera analysis for appliances, plumbing, electrical, HVAC, and more"
           />
           <FeatureCard
-            icon={<Zap size={22} />}
+            icon={<ListChecks size={22} />}
             iconColor="text-amber-400"
             iconBg="bg-amber-500/10 border-amber-500/20"
-            title="Step-by-Step Fixes"
-            description="Get clear repair instructions tailored to exactly what the AI sees"
+            title="Hands-Free Step Tracking"
+            description="AI watches your progress and auto-advances through repair steps"
+          />
+          <FeatureCard
+            icon={<Package size={22} />}
+            iconColor="text-cyan-400"
+            iconBg="bg-cyan-500/10 border-cyan-500/20"
+            title="Parts Finder"
+            description="Identifies parts by sight and finds buy links so you can order replacements"
+          />
+          <FeatureCard
+            icon={<Play size={22} />}
+            iconColor="text-purple-400"
+            iconBg="bg-purple-500/10 border-purple-500/20"
+            title="Video Guides"
+            description="Auto-fetches YouTube tutorials and repair guides for your specific problem"
           />
           <FeatureCard
             icon={<ShieldCheck size={22} />}

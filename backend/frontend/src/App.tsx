@@ -1,6 +1,10 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { AlertCircle, CheckCircle2, Wrench, RefreshCw, X, Mic, MicOff, Camera, Send, XCircle } from 'lucide-react';
 import LandingPage from './components/LandingPage';
+import PanelSwitcher, { type PanelTab } from './components/PanelSwitcher';
+import StepTracker, { MiniStepIndicator, type StepState } from './components/StepTracker';
+import PartCard, { PartToast, type IdentifiedPart } from './components/PartCard';
+import ResourcePanel, { type ResourceData } from './components/ResourcePanel';
 
 interface ChatMessage {
   id: string;
@@ -39,13 +43,21 @@ export default function FixitApp() {
   const [textInput, setTextInput] = useState('');
   const [frozenFrame, setFrozenFrame] = useState<string | null>(null);
 
+  // New feature state
+  const [activePanel, setActivePanel] = useState<PanelTab>('chat');
+  const [stepState, setStepState] = useState<StepState>({
+    steps: [], currentStep: 0, totalSteps: 0, message: '',
+  });
+  const [identifiedParts, setIdentifiedParts] = useState<IdentifiedPart[]>([]);
+  const [partToast, setPartToast] = useState<string | null>(null);
+  const [resources, setResources] = useState<ResourceData | null>(null);
+
   // Keep refs in sync with state
   useEffect(() => { isMutedRef.current = isMuted; }, [isMuted]);
   useEffect(() => { isStreamingRef.current = isStreaming; }, [isStreaming]);
 
   const addMessage = useCallback((role: ChatMessage['role'], text: string) => {
     setMessages(prev => {
-      // For user/assistant transcript, append to last message of same role
       if (
         (role === 'assistant' || role === 'user') &&
         prev.length > 0 &&
@@ -66,6 +78,15 @@ export default function FixitApp() {
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  // --- Audio flush for interruption ---
+  function flushAudioQueue() {
+    if (playbackContextRef.current) {
+      playbackContextRef.current.close();
+      playbackContextRef.current = null;
+    }
+    nextPlayTimeRef.current = 0;
+  }
 
   // --- WebSocket ---
   const connectWs = useCallback(() => {
@@ -90,6 +111,8 @@ export default function FixitApp() {
         if (msg.status === 'ready') {
           geminiReadyRef.current = true;
         }
+      } else if (msg.type === 'interrupted') {
+        flushAudioQueue();
       } else if (msg.type === 'safety_alert') {
         setSafetyAlert(msg.message);
         addMessage('assistant', `[SAFETY] ${msg.message}`);
@@ -99,6 +122,35 @@ export default function FixitApp() {
         addMessage('user', msg.text);
       } else if (msg.type === 'error') {
         addMessage('error', msg.message);
+      } else if (msg.type === 'step_update') {
+        setStepState({
+          steps: msg.steps,
+          currentStep: msg.current_step,
+          totalSteps: msg.total_steps,
+          message: msg.message || '',
+        });
+        if (activePanel === 'chat' && msg.steps.length > 0) {
+          setActivePanel('steps');
+        }
+      } else if (msg.type === 'part_identified') {
+        const part: IdentifiedPart = {
+          id: crypto.randomUUID(),
+          name: msg.name,
+          modelNumber: msg.model_number || '',
+          buyLinks: msg.buy_links || [],
+          timestamp: Date.now(),
+        };
+        setIdentifiedParts(prev => [part, ...prev].slice(0, 10));
+        if (activePanel !== 'parts') {
+          setPartToast(msg.name);
+          setTimeout(() => setPartToast(null), 4000);
+        }
+      } else if (msg.type === 'resources') {
+        setResources({
+          query: msg.query,
+          youtube: msg.youtube || [],
+          guides: msg.guides || [],
+        });
       }
     };
 
@@ -244,6 +296,11 @@ export default function FixitApp() {
     }
   };
 
+  // --- Voice commands (step nav) ---
+  const handleVoiceCommand = (command: 'next' | 'back' | 'repeat') => {
+    sendJson({ type: 'voice_command', command });
+  };
+
   // --- Photo Capture / Freeze ---
   const handleCapture = () => {
     if (frozenFrame) {
@@ -279,12 +336,21 @@ export default function FixitApp() {
   // --- Mute toggle ---
   const toggleMute = () => setIsMuted(prev => !prev);
 
+  // --- Part dismiss ---
+  const handleDismissPart = useCallback((id: string) => {
+    setIdentifiedParts(prev => prev.filter(p => p.id !== id));
+  }, []);
+
   const connectionStatus = {
     0: 'Connecting',
     1: 'Live',
     2: 'Closing',
     3: 'Offline',
   }[readyState] || 'Offline';
+
+  const hasSteps = stepState.steps.length > 0;
+  const hasParts = identifiedParts.length > 0;
+  const hasResources = resources !== null && (resources.youtube.length > 0 || resources.guides.length > 0);
 
   // Landing Page
   if (!isStreaming) {
@@ -376,6 +442,16 @@ export default function FixitApp() {
           )}
         </div>
 
+        {/* Mini step indicator (when steps tab not active) */}
+        {hasSteps && activePanel !== 'steps' && (
+          <MiniStepIndicator currentStep={stepState.currentStep} totalSteps={stepState.totalSteps} />
+        )}
+
+        {/* Part toast (when parts tab not active) */}
+        {partToast && activePanel !== 'parts' && (
+          <PartToast name={partToast} onClick={() => { setActivePanel('parts'); setPartToast(null); }} />
+        )}
+
         {/* Safety Alert Overlay */}
         {safetyAlert && (
           <div className="absolute top-24 left-4 right-4 z-50 bg-red-600 text-white p-5 rounded-2xl flex items-start gap-4 shadow-[0_20px_50px_rgba(220,38,38,0.5)] border border-red-400">
@@ -395,7 +471,7 @@ export default function FixitApp() {
           </div>
         )}
 
-        {/* Chat / Transcript Drawer */}
+        {/* Bottom Drawer */}
         <div className="absolute bottom-0 left-0 right-0 p-4 z-20 bg-gradient-to-t from-slate-950 via-slate-950/80 to-transparent">
           <div className="max-w-xl mx-auto flex flex-col gap-3">
             {/* Text input */}
@@ -419,34 +495,69 @@ export default function FixitApp() {
               </button>
             </form>
 
-            {/* Messages */}
-            <div className="bg-slate-900/60 backdrop-blur-2xl rounded-2xl border border-white/10 shadow-2xl max-h-48 overflow-y-auto">
+            {/* Panel Switcher */}
+            <PanelSwitcher
+              activePanel={activePanel}
+              onChange={setActivePanel}
+              hasSteps={hasSteps}
+              hasParts={hasParts}
+              hasResources={hasResources}
+            />
+
+            {/* Panel Content */}
+            <div className="bg-slate-900/60 backdrop-blur-2xl rounded-2xl border border-white/10 shadow-2xl">
               <div className="p-4 flex flex-col gap-2">
-                <div className="flex items-center gap-2 text-blue-400 text-[10px] font-black uppercase tracking-[0.2em] mb-1">
-                  <CheckCircle2 size={14} />
-                  Conversation
-                </div>
-                {messages.length === 0 && (
-                  <p className="text-slate-500 text-sm">Listening... speak or type to begin.</p>
+                {activePanel === 'chat' && (
+                  <>
+                    <div className="flex items-center gap-2 text-blue-400 text-[10px] font-black uppercase tracking-[0.2em] mb-1">
+                      <CheckCircle2 size={14} />
+                      Conversation
+                    </div>
+                    <div className="max-h-48 overflow-y-auto flex flex-col gap-2">
+                      {messages.length === 0 && (
+                        <p className="text-slate-500 text-sm">Listening... speak or type to begin.</p>
+                      )}
+                      {messages.map((msg) => (
+                        <div
+                          key={msg.id}
+                          className={`text-sm leading-relaxed ${
+                            msg.role === 'user'
+                              ? 'text-blue-300'
+                              : msg.role === 'error'
+                              ? 'text-red-400'
+                              : 'text-white'
+                          }`}
+                        >
+                          <span className="font-bold text-[10px] uppercase tracking-wider opacity-60 mr-2">
+                            {msg.role === 'user' ? 'You' : msg.role === 'error' ? 'Error' : 'AI'}
+                          </span>
+                          {msg.text}
+                        </div>
+                      ))}
+                      <div ref={chatEndRef} />
+                    </div>
+                  </>
                 )}
-                {messages.map((msg) => (
-                  <div
-                    key={msg.id}
-                    className={`text-sm leading-relaxed ${
-                      msg.role === 'user'
-                        ? 'text-blue-300'
-                        : msg.role === 'error'
-                        ? 'text-red-400'
-                        : 'text-white'
-                    }`}
-                  >
-                    <span className="font-bold text-[10px] uppercase tracking-wider opacity-60 mr-2">
-                      {msg.role === 'user' ? 'You' : msg.role === 'error' ? 'Error' : 'AI'}
-                    </span>
-                    {msg.text}
+
+                {activePanel === 'steps' && (
+                  <StepTracker stepState={stepState} onVoiceCommand={handleVoiceCommand} />
+                )}
+
+                {activePanel === 'parts' && (
+                  <div className="flex flex-col gap-2 max-h-48 overflow-y-auto">
+                    {identifiedParts.length === 0 ? (
+                      <p className="text-slate-500 text-sm">No parts identified yet.</p>
+                    ) : (
+                      identifiedParts.map(part => (
+                        <PartCard key={part.id} part={part} onDismiss={handleDismissPart} />
+                      ))
+                    )}
                   </div>
-                ))}
-                <div ref={chatEndRef} />
+                )}
+
+                {activePanel === 'resources' && resources && (
+                  <ResourcePanel resources={resources} />
+                )}
               </div>
             </div>
           </div>

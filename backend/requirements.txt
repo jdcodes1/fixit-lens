@@ -4,3 +4,4 @@ uvicorn[standard]
 python-multipart
 websockets
 python-dotenv
+aiohttp

@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import asyncio
 import base64
@@ -11,6 +12,7 @@ from fastapi.responses import FileResponse
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
+from api_helpers import search_parts, search_youtube, search_guides
 
 load_dotenv()
 
@@ -33,19 +35,52 @@ if not api_key:
 
 client = genai.Client(api_key=api_key)
 
-SYSTEM_PROMPT = """You are Fixit Lens, an expert AR repair assistant. The user is showing you a live camera feed of something they want to fix or understand.
+SYSTEM_PROMPT = """You are Fixit Lens, an expert AR home repair assistant. The user is showing you a live camera feed of something they want to fix.
+
+Your expertise covers:
+- Appliances: washers, dryers, dishwashers, refrigerators, ovens, microwaves
+- Plumbing: faucets, toilets, pipes, water heaters, drains
+- Electrical: outlets, switches, fixtures (always emphasize safety — recommend a licensed electrician for panel/wiring work)
+- HVAC: thermostats, filters, vents, condensers
+- Furniture: hinges, drawer slides, joints, upholstery
+- General: drywall, paint, caulking, weather stripping
 
 Your role:
-- Identify what the user is showing you (appliance, electronics, plumbing, furniture, vehicle part, etc.)
+- Identify what the user is showing you (appliance, electronics, plumbing, furniture, etc.)
 - Provide clear, step-by-step repair guidance based on what you see
 - Call out specific parts, screws, connectors, or components visible in the frame
 - Suggest tools needed for the repair
 - If you can't see clearly, ask the user to adjust the camera angle
 
+## Step-by-Step Tracking
+When you identify a multi-step repair procedure, emit structured step markers INLINE with your speech:
+
+[STEPS_START] total=N
+[STEP 1] Description of step 1
+[STEP 2] Description of step 2
+...
+[STEPS_END]
+
+As you watch the user perform steps and observe completion, emit:
+[STEP_STATUS] current=N status="completed" message="Great, that's done!" [/STEP_STATUS]
+
+Proactively confirm when you see the user complete a step. Be encouraging.
+
+## Parts Identification
+When you identify a specific part the user needs, emit:
+[PART_ID] name="Part Name" model="ModelNumber" query="search query for buying this part" [/PART_ID]
+
+Include the model number if visible on the part. Use a descriptive search query.
+
+## Repair Topic
+When you identify what the user is trying to repair, emit once:
+[REPAIR_TOPIC] query="description of the repair" category="appliance|plumbing|electrical|hvac|furniture|general" [/REPAIR_TOPIC]
+
 Safety rules (CRITICAL):
 - If you see ANY safety hazard (water near electricity, exposed wires, gas leaks, structural danger, sharp edges near hands, etc.), you MUST prefix your response with exactly [SAFETY_ALERT] followed by a clear warning
 - Always warn before the user could hurt themselves
 - Prioritize safety over repair advice
+- For electrical work beyond basic outlet/switch replacement, recommend a licensed electrician
 
 Keep responses concise and conversational since you are speaking aloud. Use short sentences."""
 
@@ -63,11 +98,143 @@ LIVE_CONFIG = types.LiveConnectConfig(
     output_audio_transcription=types.AudioTranscriptionConfig(),
 )
 
+# --- Marker parsing regexes ---
+RE_STEPS = re.compile(
+    r'\[STEPS_START\]\s*total=(\d+)(.*?)\[STEPS_END\]',
+    re.DOTALL
+)
+RE_STEP_LINE = re.compile(r'\[STEP\s+(\d+)\]\s*(.*?)(?=\[STEP\s+\d+\]|\Z)', re.DOTALL)
+RE_STEP_STATUS = re.compile(
+    r'\[STEP_STATUS\]\s*current=(\d+)\s+status="([^"]+)"\s+message="([^"]+)"\s*\[/STEP_STATUS\]'
+)
+RE_PART_ID = re.compile(
+    r'\[PART_ID\]\s*name="([^"]+)"\s*model="([^"]*)"\s*query="([^"]+)"\s*\[/PART_ID\]'
+)
+RE_REPAIR_TOPIC = re.compile(
+    r'\[REPAIR_TOPIC\]\s*query="([^"]+)"\s*category="([^"]+)"\s*\[/REPAIR_TOPIC\]'
+)
+# Combined pattern to strip all markers from transcript
+RE_ALL_MARKERS = re.compile(
+    r'\[STEPS_START\].*?\[STEPS_END\]'
+    r'|\[STEP_STATUS\].*?\[/STEP_STATUS\]'
+    r'|\[PART_ID\].*?\[/PART_ID\]'
+    r'|\[REPAIR_TOPIC\].*?\[/REPAIR_TOPIC\]',
+    re.DOTALL
+)
+
 # --- Rate limiting ---
 
 connections_per_ip: dict[str, int] = defaultdict(int)
 MAX_CONNECTIONS_PER_IP = 3
 MAX_FRAMES_PER_SEC = 2
+
+
+async def parse_and_strip_markers(text: str, step_state: dict, searched_topics: set, websocket):
+    """Parse markers from text, fire async tasks, return cleaned text."""
+    # Parse step definitions
+    steps_match = RE_STEPS.search(text)
+    if steps_match:
+        try:
+            total = int(steps_match.group(1))
+            body = steps_match.group(2)
+            steps = []
+            for m in RE_STEP_LINE.finditer(body):
+                steps.append({
+                    "number": int(m.group(1)),
+                    "text": m.group(2).strip(),
+                    "status": "pending",
+                })
+            if steps:
+                steps[0]["status"] = "active"
+                step_state["steps"] = steps
+                step_state["current_step"] = 1
+                step_state["total_steps"] = total
+                await websocket.send_json({
+                    "type": "step_update",
+                    "steps": steps,
+                    "current_step": 1,
+                    "total_steps": total,
+                    "message": "Repair steps identified",
+                })
+        except Exception:
+            pass
+
+    # Parse step status updates
+    for m in RE_STEP_STATUS.finditer(text):
+        try:
+            current = int(m.group(1))
+            status = m.group(2)
+            message = m.group(3)
+            if step_state.get("steps"):
+                for s in step_state["steps"]:
+                    if s["number"] == current:
+                        s["status"] = status
+                    elif s["number"] == current + 1 and status == "completed":
+                        s["status"] = "active"
+                if status == "completed":
+                    step_state["current_step"] = current + 1
+                await websocket.send_json({
+                    "type": "step_update",
+                    "steps": step_state["steps"],
+                    "current_step": step_state["current_step"],
+                    "total_steps": step_state["total_steps"],
+                    "message": message,
+                })
+        except Exception:
+            pass
+
+    # Parse part identification — non-blocking
+    for m in RE_PART_ID.finditer(text):
+        try:
+            name, model, query = m.group(1), m.group(2), m.group(3)
+            asyncio.create_task(_send_part_info(websocket, name, model, query))
+        except Exception:
+            pass
+
+    # Parse repair topic — non-blocking, deduplicated
+    for m in RE_REPAIR_TOPIC.finditer(text):
+        try:
+            query = m.group(1)
+            if query not in searched_topics:
+                searched_topics.add(query)
+                asyncio.create_task(_send_resources(websocket, query))
+        except Exception:
+            pass
+
+    # Strip all markers from text
+    cleaned = RE_ALL_MARKERS.sub('', text).strip()
+    return cleaned
+
+
+async def _send_part_info(websocket, name: str, model: str, query: str):
+    """Look up buy links for a part and send to client."""
+    try:
+        buy_links = await search_parts(query)
+        await websocket.send_json({
+            "type": "part_identified",
+            "name": name,
+            "model_number": model,
+            "buy_links": buy_links,
+        })
+    except Exception:
+        pass
+
+
+async def _send_resources(websocket, query: str):
+    """Look up YouTube videos and repair guides, send to client."""
+    try:
+        youtube_results, guide_results = await asyncio.gather(
+            search_youtube(query),
+            search_guides(query),
+        )
+        await websocket.send_json({
+            "type": "resources",
+            "query": query,
+            "youtube": youtube_results,
+            "guides": guide_results,
+        })
+    except Exception:
+        pass
 
 
 async def _drain_ws(websocket: WebSocket, ready: asyncio.Event):
@@ -92,6 +259,8 @@ async def websocket_endpoint(websocket: WebSocket):
     print(f"WebSocket connected from {client_ip}", flush=True)
 
     last_frame_time = 0.0
+    step_state: dict = {"steps": [], "current_step": 0, "total_steps": 0}
+    searched_topics: set = set()
     gemini_ready = asyncio.Event()
 
     async def send_error(msg: str):
@@ -181,6 +350,24 @@ async def websocket_endpoint(websocket: WebSocket):
                                         ),
                                         turn_complete=True,
                                     )
+
+                                elif msg["type"] == "voice_command":
+                                    command = msg.get("command", "")
+                                    command_prompts = {
+                                        "next": "I've completed this step. Let's move to the next one.",
+                                        "back": "Can you go back to the previous step?",
+                                        "repeat": "Can you repeat the current step instructions?",
+                                    }
+                                    prompt_text = command_prompts.get(command)
+                                    if prompt_text:
+                                        await gemini.send_client_content(
+                                            turns=types.Content(
+                                                role="user",
+                                                parts=[types.Part(text=prompt_text)],
+                                            ),
+                                            turn_complete=True,
+                                        )
+
                         except Exception as e:
                             # Log but keep the loop alive
                             print(f"Error forwarding to Gemini: {e}", flush=True)
@@ -201,6 +388,13 @@ async def websocket_endpoint(websocket: WebSocket):
                             except Exception:
                                 break
 
+                        # Detect interruption
+                        if response.server_content and response.server_content.interrupted:
+                            try:
+                                await websocket.send_json({"type": "interrupted"})
+                            except Exception:
+                                break
+
                         # Server transcript (AI speech)
                         server_text = (
                             response.server_content
@@ -211,14 +405,19 @@ async def websocket_endpoint(websocket: WebSocket):
                             for part in server_text:
                                 if part.text:
                                     text = part.text
-                                    if text.startswith("[SAFETY_ALERT]"):
-                                        alert_msg = text[len("[SAFETY_ALERT]"):].strip()
+                                    cleaned = await parse_and_strip_markers(
+                                        text, step_state, searched_topics, websocket
+                                    )
+                                    if not cleaned:
+                                        continue
+                                    if cleaned.startswith("[SAFETY_ALERT]"):
+                                        alert_msg = cleaned[len("[SAFETY_ALERT]"):].strip()
                                         await websocket.send_json(
                                             {"type": "safety_alert", "message": alert_msg}
                                         )
                                     else:
                                         await websocket.send_json(
-                                            {"type": "transcript", "text": text}
+                                            {"type": "transcript", "text": cleaned}
                                         )
 
                         # Output audio transcription
@@ -228,15 +427,19 @@ async def websocket_endpoint(websocket: WebSocket):
                             and response.server_content.output_transcription.text
                         ):
                             text = response.server_content.output_transcription.text
-                            if text.startswith("[SAFETY_ALERT]"):
-                                alert_msg = text[len("[SAFETY_ALERT]"):].strip()
-                                await websocket.send_json(
-                                    {"type": "safety_alert", "message": alert_msg}
-                                )
-                            else:
-                                await websocket.send_json(
-                                    {"type": "transcript", "text": text}
-                                )
+                            cleaned = await parse_and_strip_markers(
+                                text, step_state, searched_topics, websocket
+                            )
+                            if cleaned:
+                                if cleaned.startswith("[SAFETY_ALERT]"):
+                                    alert_msg = cleaned[len("[SAFETY_ALERT]"):].strip()
+                                    await websocket.send_json(
+                                        {"type": "safety_alert", "message": alert_msg}
+                                    )
+                                else:
+                                    await websocket.send_json(
+                                        {"type": "transcript", "text": cleaned}
+                                    )
 
                         # Input audio transcription (user speech)
                         if (
