@@ -101,25 +101,37 @@ LIVE_CONFIG = types.LiveConnectConfig(
 # --- Marker parsing regexes ---
 RE_STEPS = re.compile(
     r'\[STEPS_START\]\s*total=(\d+)(.*?)\[STEPS_END\]',
-    re.DOTALL
+    re.DOTALL | re.IGNORECASE
 )
-RE_STEP_LINE = re.compile(r'\[STEP\s+(\d+)\]\s*(.*?)(?=\[STEP\s+\d+\]|\Z)', re.DOTALL)
+RE_STEP_LINE = re.compile(r'\[STEP\s+(\d+)\]\s*(.*?)(?=\[STEP\s+\d+\]|\Z)', re.DOTALL | re.IGNORECASE)
 RE_STEP_STATUS = re.compile(
-    r'\[STEP_STATUS\]\s*current=(\d+)\s+status="([^"]+)"\s+message="([^"]+)"\s*\[/STEP_STATUS\]'
+    r'\[STEP_STATUS\]\s*current=(\d+)\s+status="([^"]+)"\s+message="([^"]+)"\s*\[/STEP_STATUS\]',
+    re.IGNORECASE
 )
 RE_PART_ID = re.compile(
-    r'\[PART_ID\]\s*name="([^"]+)"\s*model="([^"]*)"\s*query="([^"]+)"\s*\[/PART_ID\]'
+    r'\[PART_ID\]\s*name="([^"]+)"\s*model="([^"]*)"\s*query="([^"]+)"\s*\[/PART_ID\]',
+    re.IGNORECASE
 )
 RE_REPAIR_TOPIC = re.compile(
-    r'\[REPAIR_TOPIC\]\s*query="([^"]+)"\s*category="([^"]+)"\s*\[/REPAIR_TOPIC\]'
+    r'\[REPAIR_TOPIC\]\s*query="([^"]+)"\s*category="([^"]+)"\s*\[/REPAIR_TOPIC\]',
+    re.IGNORECASE
 )
-# Combined pattern to strip all markers from transcript
+# Combined pattern to strip all markers from transcript (complete + partial/orphaned)
 RE_ALL_MARKERS = re.compile(
     r'\[STEPS_START\].*?\[STEPS_END\]'
     r'|\[STEP_STATUS\].*?\[/STEP_STATUS\]'
     r'|\[PART_ID\].*?\[/PART_ID\]'
-    r'|\[REPAIR_TOPIC\].*?\[/REPAIR_TOPIC\]',
-    re.DOTALL
+    r'|\[REPAIR_TOPIC\].*?\[/REPAIR_TOPIC\]'
+    r'|\[STEPS_START\][^\[]*'
+    r'|\[STEPS_END\]'
+    r'|\[STEP\s+\d+\][^\[]*'
+    r'|\[STEP_STATUS\][^\[]*'
+    r'|\[PART_ID\][^\[]*'
+    r'|\[REPAIR_TOPIC\][^\[]*'
+    r'|\[/STEP_STATUS\]'
+    r'|\[/PART_ID\]'
+    r'|\[/REPAIR_TOPIC\]',
+    re.DOTALL | re.IGNORECASE
 )
 
 # --- Rate limiting ---
@@ -127,6 +139,38 @@ RE_ALL_MARKERS = re.compile(
 connections_per_ip: dict[str, int] = defaultdict(int)
 MAX_CONNECTIONS_PER_IP = 3
 MAX_FRAMES_PER_SEC = 2
+
+
+# --- Marker buffering helpers ---
+RE_MARKER_OPEN = re.compile(r'\[(STEPS_START|STEP_STATUS|PART_ID|REPAIR_TOPIC|STEP\s+\d+)', re.IGNORECASE)
+RE_MARKER_COMPLETE = re.compile(
+    r'\[STEPS_START\].*?\[STEPS_END\]'
+    r'|\[STEP_STATUS\].*?\[/STEP_STATUS\]'
+    r'|\[PART_ID\].*?\[/PART_ID\]'
+    r'|\[REPAIR_TOPIC\].*?\[/REPAIR_TOPIC\]',
+    re.DOTALL | re.IGNORECASE
+)
+
+
+def _might_contain_marker(text: str) -> bool:
+    """Check if text contains or starts a marker tag."""
+    return bool(RE_MARKER_OPEN.search(text))
+
+
+def _has_complete_markers(text: str) -> bool:
+    """Check if text contains at least one complete marker block."""
+    return bool(RE_MARKER_COMPLETE.search(text))
+
+
+def _get_incomplete_marker_tail(text: str) -> str:
+    """Return trailing text after the last complete marker/content, if it looks like an incomplete marker."""
+    # Remove all complete markers
+    stripped = RE_MARKER_COMPLETE.sub('', text)
+    # Check if remaining text has an opening marker tag without closing
+    m = RE_MARKER_OPEN.search(stripped)
+    if m:
+        return stripped[m.start():]
+    return ""
 
 
 async def parse_and_strip_markers(text: str, step_state: dict, searched_topics: set, websocket):
@@ -379,6 +423,7 @@ async def websocket_endpoint(websocket: WebSocket):
                     print(f"Receive loop error: {e}", flush=True)
 
             async def send_to_client():
+                transcript_buf = ""  # Buffer to accumulate transcript for marker matching
                 try:
                     async for response in gemini.receive():
                         try:
@@ -389,6 +434,18 @@ async def websocket_endpoint(websocket: WebSocket):
                             # Detect interruption
                             if response.server_content and response.server_content.interrupted:
                                 await websocket.send_json({"type": "interrupted"})
+                                # Flush any buffered transcript
+                                if transcript_buf.strip():
+                                    cleaned = RE_ALL_MARKERS.sub('', transcript_buf).strip()
+                                    if cleaned:
+                                        await websocket.send_json({"type": "transcript", "text": cleaned})
+                                transcript_buf = ""
+
+                            # Detect turn completion to flush buffer
+                            turn_complete = (
+                                response.server_content
+                                and response.server_content.turn_complete
+                            )
 
                             # Server transcript (AI speech)
                             server_text = (
@@ -399,21 +456,7 @@ async def websocket_endpoint(websocket: WebSocket):
                             if server_text:
                                 for part in server_text:
                                     if part.text:
-                                        text = part.text
-                                        cleaned = await parse_and_strip_markers(
-                                            text, step_state, searched_topics, websocket
-                                        )
-                                        if not cleaned:
-                                            continue
-                                        if cleaned.startswith("[SAFETY_ALERT]"):
-                                            alert_msg = cleaned[len("[SAFETY_ALERT]"):].strip()
-                                            await websocket.send_json(
-                                                {"type": "safety_alert", "message": alert_msg}
-                                            )
-                                        else:
-                                            await websocket.send_json(
-                                                {"type": "transcript", "text": cleaned}
-                                            )
+                                        transcript_buf += part.text
 
                             # Output audio transcription
                             if (
@@ -421,12 +464,34 @@ async def websocket_endpoint(websocket: WebSocket):
                                 and response.server_content.output_transcription
                                 and response.server_content.output_transcription.text
                             ):
-                                text = response.server_content.output_transcription.text
+                                transcript_buf += response.server_content.output_transcription.text
+
+                            # Process buffered transcript when we have complete markers or turn ends
+                            if transcript_buf and (turn_complete or _has_complete_markers(transcript_buf)):
+                                # Extract and process complete markers
                                 cleaned = await parse_and_strip_markers(
-                                    text, step_state, searched_topics, websocket
+                                    transcript_buf, step_state, searched_topics, websocket
                                 )
+                                # Keep any trailing incomplete marker in the buffer
+                                leftover = _get_incomplete_marker_tail(transcript_buf)
+                                transcript_buf = leftover
+
                                 if cleaned:
-                                    if cleaned.startswith("[SAFETY_ALERT]"):
+                                    if cleaned.upper().startswith("[SAFETY_ALERT]"):
+                                        alert_msg = cleaned[len("[SAFETY_ALERT]"):].strip()
+                                        await websocket.send_json(
+                                            {"type": "safety_alert", "message": alert_msg}
+                                        )
+                                    else:
+                                        await websocket.send_json(
+                                            {"type": "transcript", "text": cleaned}
+                                        )
+                            elif transcript_buf and not _might_contain_marker(transcript_buf):
+                                # No markers at all, send immediately
+                                cleaned = transcript_buf.strip()
+                                transcript_buf = ""
+                                if cleaned:
+                                    if cleaned.upper().startswith("[SAFETY_ALERT]"):
                                         alert_msg = cleaned[len("[SAFETY_ALERT]"):].strip()
                                         await websocket.send_json(
                                             {"type": "safety_alert", "message": alert_msg}
@@ -458,6 +523,15 @@ async def websocket_endpoint(websocket: WebSocket):
 
                 except Exception as e:
                     print(f"Gemini receive stream ended: {e}", flush=True)
+                finally:
+                    # Flush remaining buffer
+                    if transcript_buf.strip():
+                        try:
+                            cleaned = RE_ALL_MARKERS.sub('', transcript_buf).strip()
+                            if cleaned:
+                                await websocket.send_json({"type": "transcript", "text": cleaned})
+                        except Exception:
+                            pass
 
             await asyncio.gather(receive_from_client(), send_to_client())
         finally:
