@@ -14,6 +14,7 @@ COPY backend/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY backend/main.py .
+COPY backend/api_helpers.py .
 
 # Copy built frontend assets from stage 1
 COPY --from=frontend /app/index.html ./index.html
